@@ -1,0 +1,11 @@
+What interviewers ask and how to answer
+"What happens if two players send the same action simultaneously?"
+Both queue. The game loop processes them in logical timestamp order. The second one may be invalidated if it conflicts with the outcome of the first. The server is the single source of truth — both clients get the authoritative outcome.
+"What if you change to a distributed multi-server architecture?"
+Each room would be pinned to one server (consistent hashing on roomId). A Redis pub/sub layer allows servers to broadcast to each other. The matchmaking service becomes a separate microservice querying a shared Redis room registry.
+"Why 50ms tick rate? What if you changed it to 100ms?"
+20 ticks/second → 50ms latency on confirmed actions. 10 ticks/second → 100ms. For turn-based strategy, 100ms is fine. For a first-person shooter, you'd want 128 tick (7.8ms). Tick rate is a product decision — higher tick rate means more CPU/bandwidth cost.
+"What's the difference between optimistic update and lag compensation?"
+Optimistic update is client-side — show your own action immediately without waiting for server confirmation. Lag compensation is server-side — when validating an action, rewind the game state to what the player saw at the time of their action (accounting for their ping), not what the server sees right now. We implement simple optimistic updates; lag compensation is the advanced version.
+"How does your anti-cheat handle a modified client?"
+The client sends intent ("I want to move to X,Y"). The server independently re-evaluates all game rules against the authoritative state. The client cannot tell the server what the state is — only what it wants to do. A modified client can send any message it wants; the server will reject anything that violates game rules.
