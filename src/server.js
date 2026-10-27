@@ -21,8 +21,9 @@ function newGameState() {
 const channelFor = (roomId) => `room:${roomId}:events`;
 
 async function main() {
-  const pub = new Redis();
-  const sub = new Redis();
+  const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+  const pub = new Redis(REDIS_URL);
+  const sub = new Redis(REDIS_URL);
   const rooms = new Map();
   const loaded = new Map();
 

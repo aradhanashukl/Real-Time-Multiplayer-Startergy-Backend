@@ -64,7 +64,7 @@ async function main() {
   const R2 = `t2-${id}`;
   const R3 = `t3-${id}`;
   const servers = [];
-  const redis = new Redis();
+  const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 
   try {
     servers.push(await startServer(8090, 'A'));

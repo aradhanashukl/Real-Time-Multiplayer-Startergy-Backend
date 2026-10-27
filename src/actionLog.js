@@ -1,6 +1,6 @@
 const Redis = require('ioredis');
 
-const redis = new Redis(); // connects to localhost:6379
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 
 async function appendAction(roomId, action) {
   await redis.xadd(`room:${roomId}:actions`, '*', 'data', JSON.stringify(action));

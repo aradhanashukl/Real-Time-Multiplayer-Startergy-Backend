@@ -82,3 +82,16 @@ The integration test checks: actions before joining are rejected, a spoofed play
 - Two fixed players per room, no matchmaking.
 - Polling reads one stream per loaded room every second.
 - The unit tests print values for a human to compare; only the integration test asserts automatically.
+## Run with Docker
+
+```
+docker compose up --build
+```
+
+Starts Redis and two server instances (ports 8080 and 8081).
+
+```
+docker compose run --rm app-a npm run test:integration
+```
+
+Runs the integration test inside the container.
