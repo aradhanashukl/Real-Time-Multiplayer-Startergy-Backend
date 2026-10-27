@@ -1,285 +1,189 @@
-/**
- * server.js — Entry point
- *
- * RESPONSIBILITIES
- * ─────────────────
- * 1. Create the WebSocket server
- * 2. Handle connection lifecycle (open, message, close, error)
- * 3. Route incoming messages to the correct module
- * 4. Start the game loop
- *
- * WHAT THIS FILE DOES NOT DO
- * ────────────────────────────
- * It does not contain game logic. It does not validate actions. It does not
- * manage state. It is a thin router — the equivalent of an HTTP framework's
- * app.js. All real work happens in the modules it delegates to.
- *
- * MESSAGE PROTOCOL (client → server)
- * ────────────────────────────────────
- * Every message is a JSON object with a `type` field:
- *
- *   { type: 'JOIN',      payload: { gameMode?, playerName? } }
- *   { type: 'RECONNECT', payload: { sessionToken } }
- *   { type: 'ACTION',    payload: { type, payload, clientTimestamp } }
- *   { type: 'ACK',       payload: { seq } }
- *   { type: 'PING' }
- *
- * MESSAGE PROTOCOL (server → client)
- * ────────────────────────────────────
- *   { type: 'CONNECTED',          sessionToken, playerId, roomId? }
- *   { type: 'WAITING_FOR_PLAYERS', roomId, players }
- *   { type: 'GAME_START',          roomId, players, gameState }
- *   { type: 'STATE_UPDATE',        seq, tick, delta, correction }
- *   { type: 'ACTION_REJECTED',     action, reason }
- *   { type: 'RECONNECT_ACK',       snapshot, missedEvents, currentSeq }
- *   { type: 'PLAYER_RECONNECTED',  playerId }
- *   { type: 'PLAYER_FORFEITED',    playerId, reason }
- *   { type: 'GAME_OVER',           winner, seq }
- *   { type: 'PONG' }
- *   { type: 'ERROR',               message }
- *
- * WHY JSON INSTEAD OF A BINARY PROTOCOL (e.g., MessagePack, Protobuf)
- * ──────────────────────────────────────────────────────────────────────
- * JSON is human-readable — invaluable during development and debugging.
- * For a strategy game with 20 ticks/sec the extra bytes are negligible.
- * Production games (FPS, racing) use binary protocols to cut bandwidth ~60 %.
- * The switch is mechanical: replace JSON.stringify/parse with a codec.
- *
- * WHY WE HANDLE ping/pong MANUALLY
- * ───────────────────────────────────
- * ws has built-in ping/pong frames (ws.ping()). We also handle a JSON
- * { type:'PING' } message because some browser environments strip raw
- * WebSocket control frames. The JSON ping acts as an application-level
- * heartbeat and doubles as a round-trip latency probe.
- */
-
-'use strict';
-
 const { WebSocketServer } = require('ws');
-const { randomUUID: uuidv4 } = require('crypto');
+const Redis = require('ioredis');
+const { createReplica } = require('./replica');
+const { createSessions, bindIdentity } = require('./sessions');
+const { appendAction, readEntriesAfter } = require('./actionLog');
 
-const store       = require('./store');
-const broadcast   = require('./broadcast');
-const gameloop    = require('./gameloop');
-const matchmaking = require('./matchmaking');
-const reconnect   = require('./reconnect');
+const PORT = Number(process.argv[2]) || 8080;
+const NODE_ID = process.argv[3] || 'A';
+const VALID_ROOM = /^[a-zA-Z0-9_-]{1,32}$/;
 
-const PORT = process.env.PORT ?? 8080;
+function newGameState() {
+  return {
+    tick: 0,
+    players: {
+      alice: { x: 1, y: 1, hp: 100 },
+      bob:   { x: 9, y: 1, hp: 100 },
+    },
+  };
+}
 
-// ── Server setup ──────────────────────────────────────────────────────────────
+const channelFor = (roomId) => `room:${roomId}:events`;
 
-const wss = new WebSocketServer({ port: PORT });
-console.log(`[Server] WebSocket server listening on ws://localhost:${PORT}`);
+async function main() {
+  const pub = new Redis();
+  const sub = new Redis();
+  const rooms = new Map();
+  const loaded = new Map();
 
-// Start the fixed-tick game loop
-gameloop.start();
-
-// ── Connection handler ────────────────────────────────────────────────────────
-
-wss.on('connection', (ws, req) => {
-  // Assign a temporary ID; replaced by the session playerId on JOIN/RECONNECT
-  const tempId = `tmp-${uuidv4().slice(0, 8)}`;
-  let playerId  = null;
-  let sessionToken = null;
-
-  console.log(`[Server] New connection (${tempId}) from ${req.socket.remoteAddress}`);
-
-  // ── Heartbeat — detect dead connections ────────────────────────────────────
-  // WHY WE NEED THIS
-  // TCP connections can go silent without emitting a 'close' event (e.g., a
-  // mobile device losing signal without sending a FIN packet). Without
-  // heartbeating, dead sockets accumulate and consume memory indefinitely.
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; }); // WS protocol pong
-
-  // ── Message handler ────────────────────────────────────────────────────────
-
-  ws.on('message', (raw) => {
-    let msg;
+  sub.on('message', (channel, message) => {
+    const roomId = channel.slice('room:'.length, -':events'.length);
+    const room = loaded.get(roomId);
+    if (!room) return;
+    let event;
     try {
-      msg = JSON.parse(raw);
+      event = JSON.parse(message);
     } catch {
-      send(ws, { type: 'ERROR', message: 'Invalid JSON' });
       return;
     }
-
-    switch (msg.type) {
-      case 'JOIN':      handleJoin(ws, msg, tempId);       break;
-      case 'RECONNECT': handleReconnect(ws, msg);           break;
-      case 'ACTION':    handleAction(ws, msg, playerId);    break;
-      case 'ACK':       handleAck(msg, playerId);           break;
-      case 'PING':      send(ws, { type: 'PONG' });         break;
-      default:
-        send(ws, { type: 'ERROR', message: `Unknown message type: ${msg.type}` });
-    }
+    if (event.nodeId === NODE_ID) return;
+    room.replica.remote(event);
+    room.dirty = true;
   });
 
-  // ── Close handler ──────────────────────────────────────────────────────────
+  async function loadRoom(roomId) {
+    const initial = newGameState();
+    const room = {
+      id: roomId,
+      replica: createReplica(NODE_ID, initial),
+      sessions: createSessions(pub, roomId, Object.keys(initial.players)),
+      lastId: '0-0',
+      dirty: true,
+    };
+    loaded.set(roomId, room);
+    await sub.subscribe(channelFor(roomId));
 
-  ws.on('close', (code, reason) => {
-    console.log(`[Server] Connection closed: ${playerId ?? tempId} (${code})`);
-    if (playerId) {
-      reconnect.handleDisconnect(playerId);
-      // Note: we do NOT destroy the session here — it is needed for reconnect auth.
-      // Sessions are destroyed when grace period expires or game ends.
+    const saved = await readEntriesAfter(roomId, room.lastId);
+    for (const { id, event } of saved) {
+      room.replica.remote(event);
+      room.lastId = id;
     }
-  });
+    console.log(`[${NODE_ID}] room ${roomId}: recovered ${saved.length} events`);
+    return room;
+  }
 
-  ws.on('error', (err) => {
-    console.error(`[Server] WS error for ${playerId ?? tempId}:`, err.message);
-  });
-
-  // ── JOIN ───────────────────────────────────────────────────────────────────
-
-  function handleJoin(ws, msg, tempId) {
-    if (playerId) {
-      send(ws, { type: 'ERROR', message: 'Already joined' });
-      return;
+  function getRoom(roomId) {
+    if (!rooms.has(roomId)) {
+      const p = loadRoom(roomId).catch((err) => {
+        rooms.delete(roomId);
+        loaded.delete(roomId);
+        throw err;
+      });
+      rooms.set(roomId, p);
     }
+    return rooms.get(roomId);
+  }
 
-    playerId     = uuidv4();
-    sessionToken = reconnect.createSession(playerId);
+  const wss = new WebSocketServer({ port: PORT });
 
-    broadcast.register(playerId, ws);
+  function send(ws, obj) {
+    ws.send(JSON.stringify(obj));
+  }
 
-    // Send session credentials to the client — they MUST save the token for reconnect
-    send(ws, {
-      type:         'CONNECTED',
-      playerId,
-      sessionToken,
+  wss.on('connection', (ws) => {
+    ws.room = null;
+    ws.playerId = null;
+
+    ws.on('message', async (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (typeof msg !== 'object' || msg === null) return;
+
+      if (msg.type === 'JOIN' || msg.type === 'RESUME') {
+        if (ws.room) return;
+        if (typeof msg.roomId !== 'string' || !VALID_ROOM.test(msg.roomId)) {
+          send(ws, { type: 'ERROR', reason: 'bad room id' });
+          return;
+        }
+        try {
+          const room = await getRoom(msg.roomId);
+          let playerId;
+          let token;
+          if (msg.type === 'JOIN') {
+            token = await room.sessions.join(msg.playerId);
+            playerId = token ? msg.playerId : null;
+          } else {
+            playerId = await room.sessions.resume(msg.token);
+            token = msg.token;
+          }
+          if (!playerId || ws.room) {
+            send(ws, { type: 'ERROR', reason: 'join refused' });
+            return;
+          }
+          ws.room = room;
+          ws.playerId = playerId;
+          send(ws, { type: 'JOINED', roomId: room.id, playerId, token });
+          send(ws, { type: 'STATE', node: NODE_ID, state: room.replica.state() });
+        } catch (err) {
+          console.error(`[${NODE_ID}]`, err.message);
+          send(ws, { type: 'ERROR', reason: 'room unavailable' });
+        }
+        return;
+      }
+
+      if (!ws.room) {
+        send(ws, { type: 'ERROR', reason: 'not joined' });
+        return;
+      }
+      if (typeof msg.action !== 'object' || msg.action === null) return;
+
+      const room = ws.room;
+      try {
+        const orderer = await room.sessions.orderer(ws.playerId);
+        const ready = orderer.accept(msg.seq, msg.action);
+        for (const raw of ready) {
+          const action = bindIdentity(ws.playerId, raw);
+          if (action === null) continue;
+          const event = room.replica.local(action);
+          room.dirty = true;
+          await appendAction(room.id, event);
+          await pub.publish(channelFor(room.id), JSON.stringify(event));
+        }
+        if (ready.length > 0) {
+          await room.sessions.saveSeq(ws.playerId, orderer.next() - 1);
+        }
+      } catch (err) {
+        console.error(`[${NODE_ID}]`, err.message);
+      }
     });
+  });
 
+  let polling = false;
+  setInterval(async () => {
+    if (polling) return;
+    polling = true;
     try {
-      const room = matchmaking.findOrCreateRoom(playerId, msg.payload ?? {});
-
-      if (room.status === matchmaking.ROOM_STATUS.WAITING) {
-        // Room not full yet — tell the player to wait
-        broadcast.broadcastToRoom(room.id, {
-          type:    'WAITING_FOR_PLAYERS',
-          roomId:  room.id,
-          count:   room.players.length,
-          needed:  room.maxPlayers,
-        });
-      } else {
-        // Room just became full and has started
-        broadcast.broadcastToRoom(room.id, {
-          type:      'GAME_START',
-          roomId:    room.id,
-          players:   room.players,
-          gameState: room.gameState,
-        });
+      for (const room of loaded.values()) {
+        const entries = await readEntriesAfter(room.id, room.lastId);
+        for (const { id, event } of entries) {
+          room.replica.remote(event);
+          room.lastId = id;
+        }
+        if (entries.length > 0) room.dirty = true;
       }
     } catch (err) {
-      console.error(`[Server] Join failed for ${playerId}:`, err.message);
-      send(ws, { type: 'ERROR', message: err.message });
+      console.error(`[${NODE_ID}] catch-up failed:`, err.message);
+    } finally {
+      polling = false;
     }
-  }
+  }, 1000);
 
-  // ── RECONNECT ──────────────────────────────────────────────────────────────
-
-  function handleReconnect(ws, msg) {
-    const { sessionToken: token, playerId: pid } = msg.payload ?? {};
-    if (!token || !pid) {
-      send(ws, { type: 'ERROR', message: 'RECONNECT requires sessionToken and playerId' });
-      return;
+  setInterval(() => {
+    for (const room of loaded.values()) {
+      if (!room.dirty) continue;
+      room.dirty = false;
+      const msg = JSON.stringify({ type: 'STATE', node: NODE_ID, state: room.replica.state() });
+      for (const client of wss.clients) {
+        if (client.readyState === 1 && client.room === room) client.send(msg);
+      }
     }
+  }, 50);
 
-    const result = reconnect.handleReconnect(pid, token, ws);
-    if (!result.success) {
-      send(ws, { type: 'ERROR', message: result.error });
-      return;
-    }
-
-    // Adopt the restored identity on this connection
-    playerId     = pid;
-    sessionToken = token;
-  }
-
-  // ── ACTION ─────────────────────────────────────────────────────────────────
-
-  function handleAction(ws, msg, pid) {
-    if (!pid) {
-      send(ws, { type: 'ERROR', message: 'Must JOIN before sending actions' });
-      return;
-    }
-
-    const room = matchmaking.getRoomForPlayer(pid);
-    if (!room) {
-      send(ws, { type: 'ERROR', message: 'Not in a room' });
-      return;
-    }
-    if (room.status !== matchmaking.ROOM_STATUS.ACTIVE) {
-      send(ws, { type: 'ERROR', message: 'Game is not active' });
-      return;
-    }
-
-    // Enqueue for the next game loop tick — do NOT process synchronously here.
-    // Processing inline would block the event loop and delay other connections.
-    gameloop.enqueueAction(room.id, pid, msg.payload);
-  }
-
-  // ── ACK ────────────────────────────────────────────────────────────────────
-
-  /**
-   * Client sends { type:'ACK', payload:{ seq } } after successfully applying
-   * a STATE_UPDATE. The server uses lastAckSeq to:
-   *   a) Set the correction flag on future broadcasts (reconciliation)
-   *   b) Know the minimum seq to include in reconnect event logs
-   */
-  function handleAck(msg, pid) {
-    if (!pid) return;
-    const room = matchmaking.getRoomForPlayer(pid);
-    if (!room) return;
-    const player = room.players.find(p => p.id === pid);
-    if (player && msg.payload?.seq > (player.lastAckSeq ?? 0)) {
-      player.lastAckSeq = msg.payload.seq;
-      store.setRoom(room.id, room);
-    }
-  }
-});
-
-// ── Global heartbeat interval ─────────────────────────────────────────────────
-//
-// Every 30 s, ping all connected sockets. Any socket that has not responded
-// since the last ping is terminated. This prevents ghost connections from
-// accumulating when mobile devices lose signal without closing the TCP connection.
-
-const HEARTBEAT_INTERVAL = 30_000;
-
-const heartbeatTimer = setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) {
-      console.log('[Server] Terminating unresponsive connection');
-      return ws.terminate();
-    }
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_INTERVAL);
-
-wss.on('close', () => clearInterval(heartbeatTimer));
-
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
-
-process.on('SIGINT',  shutdown);
-process.on('SIGTERM', shutdown);
-
-function shutdown() {
-  console.log('[Server] Shutting down gracefully...');
-  gameloop.stop();
-  broadcast.broadcastToAll({ type: 'SERVER_SHUTDOWN', message: 'Server is restarting' });
-  wss.close(() => {
-    console.log('[Server] All connections closed. Exiting.');
-    process.exit(0);
-  });
+  console.log(`[${NODE_ID}] running on ws://localhost:${PORT}`);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function send(ws, message) {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(message));
-  }
-}
-
-module.exports = { wss }; // exported for tests
+main();

@@ -1,167 +1,84 @@
-# Real-Time Multiplayer Strategy Backend
+# Real-Time Multiplayer Backend
 
-A production-architecture WebSocket backend demonstrating the hard engineering
-problems in multiplayer game infrastructure.
+A Node.js game backend where two server instances share one game through Redis and stay consistent. Built with WebSockets, Redis Streams and Redis pub/sub.
 
----
+## What it does
 
-## What this project covers
+- **Pure game rules.** Move and attack are pure functions that return a new state, so the same actions always give the same result.
+- **Event log and replay.** Every action is saved to a Redis Stream before it is applied. After a crash, the server rebuilds the game by replaying the log.
+- **Sequence numbers.** Each player stamps actions with a counter. Early actions wait, duplicates and old numbers are dropped.
+- **Lamport clocks.** Events from different instances are ordered by `(time, nodeId)`, so every instance replays the same sequence and ends in the same state.
+- **Two instances, one game.** Instances exchange events over Redis pub/sub and also poll the Stream, so a missed message is caught up.
+- **Server-side identity.** A player must `JOIN` or `RESUME` with a token. The server decides whose action it is, so a client cannot act for someone else. Tokens and sequence counters live in Redis, so a player can resume on either instance.
+- **Rooms and snapshots.** Many independent rooms, and snapshots keep state rebuilds fast.
 
-| Problem                    | Module               | Technique                                            |
-| -------------------------- | -------------------- | ---------------------------------------------------- |
-| Concurrent action ordering | `gameloop/`          | Fixed tick loop + server-assigned logical timestamps |
-| Authoritative game state   | `gameloop/`, `room/` | Single mutable state, server-only writes             |
-| Anti-cheat                 | `anticheat/`         | Server-side re-validation of every action            |
-| State sync                 | `reconciliation/`    | Minimal delta computation + delta merging            |
-| Optimistic updates         | `client-demo/`       | Apply locally → rollback on correction flag          |
-| Reconnect                  | `reconnect/`         | Grace period + snapshot + event log replay           |
-| Packet ordering            | `store/`             | Monotonic sequence numbers (Lamport clocks)          |
-| Bandwidth efficiency       | `reconciliation/`    | Delta-only broadcasts, not full state                |
-
----
-
-## Folder structure
+## Project layout
 
 ```
 src/
-├── server.js          Entry point — WS server, message router
-├── store/             In-memory state (→ swap for Redis in prod)
-├── matchmaking/       Room registry, lobby queue, game start
-├── room/              Pure state mutation functions (applyAction)
-├── gameloop/          Fixed-tick authoritative loop (50 ms / 20 ticks/sec)
-├── anticheat/         Validates every action against server state
-├── reconciliation/    State diff + delta merge + correction detection
-├── reconnect/         Grace period, session tokens, event log replay
-└── broadcast/         WebSocket fan-out (room / player / all)
-
-tests/
-├── run-tests.js        Zero-dependency test runner
-├── anticheat.test.js
-├── gameloop.test.js
-├── matchmaking.test.js
-└── reconciliation.test.js
-
-client-demo/
-└── simulate.js         4 fake players with real WS connections
+  game.js        pure rules: movePlayer, attackPlayer, applyAction, replay
+  ordering.js    per-player sequence ordering
+  lamport.js     Lamport clock and event comparison
+  replica.js     sorted event log, snapshots, state rebuild
+  sessions.js    join / resume / identity, backed by Redis
+  actionLog.js   Redis Stream read and write
+  server.js      WebSocket server, rooms, pub/sub, polling
+tests/           unit tests and one integration test
+client-demo/     small scripts for trying the server by hand
+DECISIONS.md     what I chose, the alternatives, and why
 ```
 
----
+## Run it
 
-## Quick start
+You need Node.js and Docker.
 
-```bash
+```
+docker run -d --name redis -p 6379:6379 redis
 npm install
-
-# Terminal 1 — start the server
-npm start
-
-# Terminal 2 — run the 4-player simulation
-npm run demo
-
-# Run all tests
-npm test
+node src/server.js 8080 A
+node src/server.js 8081 B
 ```
 
----
+The two arguments are the port and the instance name. Start the instances in separate terminals.
 
-## Message protocol
+## Messages
 
-### Client → Server
+Join a room (the server replies with a token):
 
-```jsonc
-{ "type": "JOIN",      "payload": { "gameMode": "standard" } }
-{ "type": "RECONNECT", "payload": { "playerId": "...", "sessionToken": "..." } }
-{ "type": "ACTION",    "payload": { "type": "MOVE", "payload": { "to": [2,1] }, "clientTimestamp": 1234 } }
-{ "type": "ACTION",    "payload": { "type": "ATTACK", "payload": { "targetPlayerId": "..." } } }
-{ "type": "ACTION",    "payload": { "type": "PASS" } }
-{ "type": "ACK",       "payload": { "seq": 42 } }
-{ "type": "PING" }
+```json
+{ "type": "JOIN", "roomId": "room1", "playerId": "bob" }
 ```
 
-### Server → Client
+Come back after a disconnect, on either instance:
 
-```jsonc
-{ "type": "CONNECTED",           "playerId": "...", "sessionToken": "..." }
-{ "type": "WAITING_FOR_PLAYERS", "count": 2, "needed": 4 }
-{ "type": "GAME_START",          "roomId": "...", "players": [...], "gameState": {...} }
-{ "type": "STATE_UPDATE",        "seq": 5, "tick": 5, "delta": {...}, "correction": false }
-{ "type": "ACTION_REJECTED",     "action": {...}, "reason": "Not enough AP" }
-{ "type": "RECONNECT_ACK",       "snapshot": {...}, "missedEvents": [...], "currentSeq": 42 }
-{ "type": "PLAYER_RECONNECTED",  "playerId": "..." }
-{ "type": "PLAYER_FORFEITED",    "playerId": "...", "reason": "disconnection_timeout" }
-{ "type": "GAME_OVER",           "winner": "...", "seq": 99 }
-{ "type": "PONG" }
+```json
+{ "type": "RESUME", "roomId": "room1", "token": "<token>" }
 ```
 
----
+Send an action:
 
-## Key design decisions and why
+```json
+{ "seq": 1, "action": { "type": "MOVE", "dx": -1, "dy": 0 } }
+{ "seq": 2, "action": { "type": "ATTACK", "targetId": "alice" } }
+```
 
-### Fixed tick rate (50 ms)
+The player id inside an action is ignored and replaced by the authenticated one.
 
-All actions queued between tick N and tick N+1 are sorted deterministically
-(server `receivedAt` timestamp, then player ID as tiebreaker) and applied in
-order. This guarantees identical state given the same inputs — the foundation
-of deterministic replays.
+## Test it
 
-Changing to 100 ms: lower CPU cost, higher latency. For turn-based games
-acceptable. For FPS: 128 ticks/sec (7.8 ms).
+```
+npm test                   # pure-logic tests, no Redis needed
+npm run test:integration   # starts two real instances, needs Redis running
+```
 
-### Server-assigned sequence numbers
+The integration test checks: actions before joining are rejected, a spoofed player id has no effect, a taken slot cannot be joined twice, resume keeps the sequence counter, rooms are isolated, a second instance recovers a room from Redis, a missed event arrives by polling, bad room ids are refused, and resume works on the other instance.
 
-Wall-clock timestamps drift between machines. Sequence numbers are server-
-controlled monotonic integers. Reconnecting players request "events since seq N"
-with guaranteed completeness.
+## Known limits
 
-### Chebyshev distance for movement
-
-Allows diagonal movement at cost 1 (like a chess king). Euclidean (√2 per
-diagonal) is awkward for integer ranges. Manhattan (no diagonals) is too
-restrictive.
-
-### Delta broadcast instead of full state
-
-Full state at 20 ticks/sec × 4 players ≈ 160 KB/sec per room.
-Delta broadcast reduces this by ~97 % — only changed fields are sent.
-Clients reconstruct state with `applyDelta`.
-
-### In-memory store (→ Redis)
-
-All live game state in a Map. Swapping to Redis requires only changing the
-get/set/delete calls in `src/store/index.js`. Nothing else changes.
-
-### Grace period on disconnect
-
-30 seconds. Player slot is preserved. Game continues with their unit frozen.
-After expiry, FORFEIT is applied and the room is notified.
-
----
-
-## Interview questions and answers
-
-**Q: What happens when two players send actions simultaneously?**
-Both are queued. On the next tick, both are sorted by server-assigned
-`receivedAt` timestamp. The second may be rejected by anti-cheat if the
-first invalidated the preconditions (e.g., the target was already killed).
-Both players receive the authoritative outcome.
-
-**Q: How do you scale to multiple servers?**
-Pin each room to one server (consistent hashing on roomId). Use Redis pub/sub
-for cross-server broadcasts. Replace `src/store/index.js` with a Redis adapter.
-Matchmaking becomes a separate service querying the shared room registry.
-
-**Q: What if a client modifies their local state?**
-Irrelevant. The server never reads client state. Clients only send intent
-(MOVE, ATTACK). The server re-validates against authoritative state. A client
-that claims "I moved 10 squares" is rejected at anti-cheat.
-
-**Q: What is the correction flag?**
-If a client's `lastAckSeq` is more than 1 behind the current server seq,
-`correction: true` is set on their STATE_UPDATE. The client discards its
-optimistic updates and treats the incoming delta as ground truth.
-
-**Q: Why not use Socket.IO?**
-Socket.IO adds abstraction (rooms, namespaces, fallback transports) that
-obscures what is happening. Raw `ws` makes the mechanism visible and
-avoids the overhead of HTTP long-polling fallback, which is irrelevant
-for a game that requires WebSockets.
+- Delivery is at-least-once. A crash between saving an action and saving its sequence number can let a retry apply twice.
+- Slots and tokens never expire.
+- A late event from another instance can change earlier history, so a client may see a state correction.
+- Redis is a single point of failure.
+- Two fixed players per room, no matchmaking.
+- Polling reads one stream per loaded room every second.
+- The unit tests print values for a human to compare; only the integration test asserts automatically.

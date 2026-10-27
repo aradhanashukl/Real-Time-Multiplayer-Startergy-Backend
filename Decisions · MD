@@ -1,0 +1,79 @@
+# Decisions
+
+Each section: what I chose, what the alternative was, and why.
+
+## 1. Game rules are pure functions
+
+**Chose:** `movePlayer`, `attackPlayer` and `applyAction` take a state and return a new state. They never modify the old one.
+**Alternative:** mutate the state in place (`player.x += 1`).
+**Why:** replay only works if the same starting state plus the same actions always gives the same result. Pure functions also make the rules easy to test alone, and an illegal action simply returns the original state, so a bad message cannot crash or change the game.
+
+## 2. The game is a log of events, not a stored state
+
+**Chose:** every action is stored in a Redis Stream. State is rebuilt with `replay(initialState, events)`.
+**Alternative:** save the whole state in a Redis hash after every change.
+**Why:** an event log can rebuild the exact state after a crash, and it is the same data that lets other instances catch up. A state hash alone cannot tell you how the game got there, and two instances writing to it would overwrite each other.
+
+## 3. Save the event before applying it
+
+**Chose:** `await appendAction(...)` first, then publish, then show the result.
+**Alternative:** apply first, save later.
+**Why:** if the server crashed after applying but before saving, players would have seen something the log never recorded. Saving first means the log is always at least as far ahead as what any player saw.
+
+## 4. Per-player sequence numbers
+
+**Chose:** each client stamps actions with `seq` 1, 2, 3. The server holds early actions until the gap fills, drops duplicates and old numbers, and refuses numbers far ahead (`MAX_AHEAD = 100`) so a client cannot fill memory.
+**Alternative:** apply actions in the order they arrive.
+**Why:** a single WebSocket already delivers in order, so this protects against retries, resends after reconnect and duplicates, where one click could otherwise move a player twice. The counter is kept per player, in Redis, so it survives a reconnect to either instance.
+
+## 5. Lamport clock with a node-id tiebreak
+
+**Chose:** each instance keeps a counter. Local event: increment. Remote event: `max(local, remote) + 1`. Events are ordered by `(time, nodeId)`.
+**Alternative:** order events by wall-clock time, or by the order they arrive.
+**Why:** instances do not share a clock, and arrival order differs between instances, which makes them disagree. A Lamport clock gives every instance the same order, and that order respects cause and effect. Two events can get the same time without either instance having seen the other, so the node id breaks the tie identically everywhere. The order is not "what really happened first", only "the same order on every instance".
+
+## 6. Replica: sort the events, then replay
+
+**Chose:** each instance keeps its events sorted by Lamport order and derives state from them.
+**Alternative:** apply each event the moment it arrives.
+**Why:** applying on arrival lets two instances reach different states (a move and an attack that depend on order). Sorting first means both replay the same sequence and end in the same state.
+
+## 7. Snapshots, taken 20 events behind the newest
+
+**Chose:** remember the state after the first N events and replay only what came after, cached until something changes. The snapshot is kept 20 events behind (`SAFETY_MARGIN`).
+**Alternative:** replay the whole log on every state read.
+**Why:** a full replay costs more the longer the game runs. A late event from another instance is usually only slightly old, so a snapshot kept 20 events behind is normally still valid. If an event does land before the snapshot, the snapshot is thrown away and rebuilt, which is slow once but still correct.
+
+## 8. Pub/sub for speed, Stream polling for safety
+
+**Chose:** instances push events to each other over Redis pub/sub and also poll the Stream every second for anything newer than the last entry id they saw.
+**Alternative:** pub/sub only, or polling only.
+**Why:** pub/sub is fast but fire-and-forget, so a brief disconnect loses events silently. Polling alone would be correct but add up to a second of delay and constant reads. Together, pub/sub is the fast path and polling is the safety net. Duplicates are harmless because the replica ignores an event it has already seen.
+
+## 9. Identity decided by the server, stored in Redis
+
+**Chose:** a connection must `JOIN` (gets a secret token) or `RESUME` (shows the token) before acting. The server overwrites the player id inside every action with the authenticated one. Slots, tokens and sequence counters live in Redis, and a slot is taken with `SET ... NX`.
+**Alternative:** trust the `playerId` the client sends; keep sessions in server memory.
+**Why:** trusting the client lets anyone move any player. In-memory sessions do not work across two instances. `SET NX` makes "only one connection takes this slot" true even when two instances race for it. The token key is written before the slot key, so a crash in between leaves only an unused token, never a locked seat.
+
+## 10. Rooms, with strict room ids
+
+**Chose:** each room has its own stream, channel, replica and sessions, created on first use. A room id must match `^[a-zA-Z0-9_-]{1,32}$`. `getRoom` stores the promise of the room, not the finished room.
+**Alternative:** one global game; free-form room ids.
+**Why:** room ids become part of Redis key and channel names, so characters like `:` or `*` could change what a key means. Storing the promise means two players joining the same new room at the same moment share one load instead of creating two separate copies.
+
+## 11. No fixed tick loop
+
+**Chose:** actions are applied as they arrive, ordered by Lamport time. The server only broadcasts state at most 20 times a second, and only when it changed.
+**Alternative:** a fixed 20 ticks/sec loop that applies queued actions.
+**Why:** my first version had a tick loop. Once ordering comes from `(time, nodeId)`, a tick adds nothing to correctness. I dropped it and do not claim it.
+
+## Known limits
+
+- Delivery is at-least-once. A crash between saving an action and saving its `seq` can let a retry apply twice.
+- Slots and tokens never expire, so a lost token keeps a seat taken.
+- A late event from another instance can rewrite earlier history, so a client may see a state correction.
+- Redis is a single point of failure.
+- Two fixed players per room, no matchmaking.
+- Polling reads one stream per loaded room every second, which would not scale to thousands of rooms.
+- Pure-logic unit tests print values for me to compare; only the integration test asserts automatically.

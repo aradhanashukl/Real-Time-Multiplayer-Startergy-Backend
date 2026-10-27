@@ -1,17 +1,18 @@
 {
-  "name": "multiplayer-strategy-backend",
+  "name": "multiplayer_backend",
   "version": "1.0.0",
-  "description": "Real-time multiplayer backend: authoritative server, matchmaking, anti-cheat, state reconciliation, reconnect handling",
-  "main": "src/server.js",
+  "description": "",
+  "main": "game.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev":   "node --watch src/server.js",
-    "demo":  "node client-demo/simulate.js",
-    "test":  "node tests/run-tests.js"
+    "test": "node tests/game.test.js && node tests/replay.test.js && node tests/ordering.test.js && node tests/lamport.test.js && node tests/replica.test.js && node tests/snapshot.test.js",
+    "test:integration": "node tests/integration.test.js"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
   "dependencies": {
-    "ws":   "^8.16.0",
-    "uuid": "^9.0.0"
-  },
-  "engines": { "node": ">=18.0.0" }
+    "ioredis": "^6.0.0",
+    "ws": "^8.22.0"
+  }
 }
